@@ -312,12 +312,14 @@ def _read_flexible(path, **kwargs):
         return pd.read_excel(path, **kwargs)
 
 
-def _load_history_file():
+def _load_history_file(language="Python"):
     history = None
-    for h in [
-        os.path.join(RAW_DIR, "lstm_training_history.xls"),
-        p("lstm_training_history.csv"),
-    ]:
+    candidates = (
+        [os.path.join(RAW_DIR, "lstm_training_history_R.csv"), p("lstm_training_history_R.csv")]
+        if language == "R"
+        else [os.path.join(RAW_DIR, "lstm_training_history.xls"), p("lstm_training_history.csv")]
+    )
+    for h in candidates:
         if os.path.exists(h):
             try:
                 history = _read_flexible(h)
@@ -463,6 +465,135 @@ def _normalize_metrics_df(metrics):
     return metrics.reset_index(drop=True)
 
 
+def _ensure_prediction_columns(pred, cleaned=None):
+    """
+    Guarantee that pred has every column the dashboard tabs rely on:
+    Date, Store ID, Product ID, Actual, LSTM_Predicted, SVR_Predicted,
+    Inventory_Level, Reorder_Alert, Expiry_Risk.
+
+    This is a safety net so the dashboard never crashes with a KeyError just
+    because a particular pipeline (Python, R, a future one) used slightly
+    different column names or forgot to compute a derived column. It repairs
+    what it can from common alternate names, then computes anything still
+    missing from what IS available, rather than assuming the source file is
+    exactly right.
+    """
+    pred = pred.copy()
+
+    # 1. Normalize column names: strip whitespace, and map common variants
+    #    (e.g. "LSTM_Pred" from an earlier pipeline version) onto the
+    #    canonical names the rest of the dashboard expects.
+    pred.columns = [str(c).strip() for c in pred.columns]
+    rename_map = {
+        "LSTM_Pred": "LSTM_Predicted",
+        "LSTM Predicted": "LSTM_Predicted",
+        "SVR_Pred": "SVR_Predicted",
+        "SVR Predicted": "SVR_Predicted",
+        "Inventory Level": "Inventory_Level",
+        "Reorder Alert": "Reorder_Alert",
+        "Expiry Risk": "Expiry_Risk",
+    }
+    pred.rename(columns={k: v for k, v in rename_map.items() if k in pred.columns}, inplace=True)
+
+    required_ids = ["Date", "Store ID", "Product ID", "Actual"]
+    missing_ids = [c for c in required_ids if c not in pred.columns]
+    if missing_ids:
+        # These can't be safely fabricated — fail loudly and specifically
+        # instead of letting a downstream tab crash with a cryptic KeyError.
+        raise KeyError(
+            f"Prediction data is missing required column(s) {missing_ids}. "
+            "Check that the pipeline that generated this file writes these columns."
+        )
+
+    # 2. Inventory_Level: derive from the cleaned dataset if not present.
+    if "Inventory_Level" not in pred.columns or pred["Inventory_Level"].isna().all():
+        derived = None
+        if cleaned is not None:
+            inv_col = next((c for c in ["Inventory_Level", "Inventory Level", "Inventory.Level"] if c in cleaned.columns), None)
+            if inv_col is not None:
+                key_cols = [c for c in ["Date", "Store ID", "Product ID"] if c in cleaned.columns]
+                if len(key_cols) == 3:
+                    lookup = cleaned[key_cols + [inv_col]].rename(columns={inv_col: "Inventory_Level"})
+                    pred = pred.drop(columns=["Inventory_Level"], errors="ignore").merge(
+                        lookup, on=key_cols, how="left"
+                    )
+                    derived = True
+        if derived is None:
+            pred["Inventory_Level"] = 0.0
+
+    # 3. LSTM_Predicted / SVR_Predicted: if genuinely absent, fall back to
+    #    whichever prediction column IS available rather than crashing charts.
+    if "LSTM_Predicted" not in pred.columns:
+        pred["LSTM_Predicted"] = pred["SVR_Predicted"] if "SVR_Predicted" in pred.columns else np.nan
+    if "SVR_Predicted" not in pred.columns:
+        pred["SVR_Predicted"] = pred["LSTM_Predicted"]
+
+    pred["Inventory_Level"] = pd.to_numeric(pred["Inventory_Level"], errors="coerce").fillna(0.0)
+    pred["LSTM_Predicted"] = pd.to_numeric(pred["LSTM_Predicted"], errors="coerce")
+    pred["SVR_Predicted"] = pd.to_numeric(pred["SVR_Predicted"], errors="coerce")
+
+    # 4. Reorder_Alert / Expiry_Risk: compute from the same rule used
+    #    everywhere else in the dashboard if the pipeline didn't provide them.
+    demand_signal = pred["LSTM_Predicted"].fillna(pred["SVR_Predicted"]).fillna(0.0)
+    if "Reorder_Alert" not in pred.columns or pred["Reorder_Alert"].isna().all():
+        pred["Reorder_Alert"] = (demand_signal > (pred["Inventory_Level"] * 0.70)).astype(int)
+    if "Expiry_Risk" not in pred.columns or pred["Expiry_Risk"].isna().all():
+        pred["Expiry_Risk"] = ((pred["Inventory_Level"] > 0.60) & (demand_signal < 0.30)).astype(int)
+
+    pred["Reorder_Alert"] = pd.to_numeric(pred["Reorder_Alert"], errors="coerce").fillna(0).astype(int)
+    pred["Expiry_Risk"] = pd.to_numeric(pred["Expiry_Risk"], errors="coerce").fillna(0).astype(int)
+
+    pred["Date"] = pd.to_datetime(pred["Date"], errors="coerce")
+    pred["Store ID"] = pred["Store ID"].astype(str)
+    pred["Product ID"] = pred["Product ID"].astype(str)
+    pred = pred.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+    return pred
+
+
+def _ensure_metrics_columns(metrics):
+    """
+    Guarantee metrics_df has the columns the Model Metrics tab relies on:
+    Model, sMAPE (%) or MAPE (%), RMSE, Accuracy (%).
+
+    Same rationale as _ensure_prediction_columns: different pipelines
+    (Python, R, future ones) may write "sMAPE" instead of "sMAPE (%)", etc.
+    Normalize known variants and derive anything still missing rather than
+    trusting the source file to match exactly.
+    """
+    metrics = metrics.copy()
+    metrics.columns = [str(c).strip() for c in metrics.columns]
+
+    rename_map = {
+        "sMAPE": "sMAPE (%)",
+        "SMAPE": "sMAPE (%)",
+        "smape": "sMAPE (%)",
+        "MAPE": "MAPE (%)",
+        "mape": "MAPE (%)",
+        "Accuracy": "Accuracy (%)",
+        "accuracy": "Accuracy (%)",
+        "model": "Model",
+        "rmse": "RMSE",
+    }
+    metrics.rename(columns={k: v for k, v in rename_map.items() if k in metrics.columns}, inplace=True)
+
+    if "Model" not in metrics.columns:
+        raise KeyError("Metrics data is missing required column 'Model'.")
+
+    if "RMSE" not in metrics.columns:
+        metrics["RMSE"] = np.nan
+
+    smape_col = "sMAPE (%)" if "sMAPE (%)" in metrics.columns else ("MAPE (%)" if "MAPE (%)" in metrics.columns else None)
+    if smape_col is None:
+        metrics["sMAPE (%)"] = np.nan
+        smape_col = "sMAPE (%)"
+
+    if "Accuracy (%)" not in metrics.columns:
+        metrics["Accuracy (%)"] = (100 - pd.to_numeric(metrics[smape_col], errors="coerce")).clip(lower=0)
+
+    return metrics
+
+
 def _query_mysql(connection, query):
     cursor = connection.cursor(dictionary=True)
     try:
@@ -473,11 +604,27 @@ def _query_mysql(connection, query):
 
 
 @st.cache_data
-def load_file_data():
+def load_file_data(language="Python"):
+    if language == "R":
+        pred_path = os.path.join(RAW_DIR, "validation_predictions_R.csv")
+        metrics_path = os.path.join(RAW_DIR, "validation_metrics_R.csv")
+        cleaned_path = os.path.join(RAW_DIR, "cleaned_grocery_inventory_R.csv")
+        if not (os.path.exists(pred_path) and os.path.exists(metrics_path) and os.path.exists(cleaned_path)):
+            raise FileNotFoundError(
+                "R outputs not found in store/raw/. Run train_pipeline.R and copy "
+                "validation_predictions_R.csv, validation_metrics_R.csv, "
+                "cleaned_grocery_inventory_R.csv and lstm_training_history_R.csv into store/raw/."
+            )
+        pred = _read_flexible(pred_path, parse_dates=["Date"])
+        metrics = _read_flexible(metrics_path)
+        cleaned = _read_flexible(cleaned_path, parse_dates=["Date"])
+        history = _load_history_file(language="R")
+        return pred, metrics, history, cleaned
+
     pred = _read_flexible(os.path.join(RAW_DIR, "validation_predictions.xls"), parse_dates=["Date"])
     metrics = _read_flexible(os.path.join(RAW_DIR, "validation_metrics.xls"))
     cleaned = _read_flexible(os.path.join(RAW_DIR, "cleaned_grocery_inventory.xls"), parse_dates=["Date"])
-    history = _load_history_file()
+    history = _load_history_file(language="Python")
     return pred, metrics, history, cleaned
 
 
@@ -688,24 +835,35 @@ def load_odoo_data(base_url, database, username, password, api_key):
 # ─────────────────────────────────────────────
 # DATA LOADER
 # ─────────────────────────────────────────────
-def load_data(source, db_config=None):
+def load_data(source, db_config=None, language="Python"):
     if source == "Database":
-        return load_mysql_data(
+        pred, metrics, history, cleaned = load_mysql_data(
             db_config["host"],
             db_config["port"],
             db_config["user"],
             db_config["password"],
             db_config["database"],
         )
-    if source == "Odoo":
-        return load_odoo_data(
+    elif source == "Odoo":
+        pred, metrics, history, cleaned = load_odoo_data(
             db_config["base_url"],
             db_config["database"],
             db_config["username"],
             db_config["password"],
             db_config["api_key"],
         )
-    return load_file_data()
+    else:
+        pred, metrics, history, cleaned = load_file_data(language=language)
+
+    # Safety net: guarantee pred and metrics have every column the tabs need,
+    # regardless of which pipeline/language/source produced them.
+    # See _ensure_prediction_columns and _ensure_metrics_columns.
+    original_attrs = pred.attrs
+    pred = _ensure_prediction_columns(pred, cleaned=cleaned)
+    pred.attrs.update(original_attrs)
+    metrics = _ensure_metrics_columns(metrics)
+
+    return pred, metrics, history, cleaned
 
 
 # ─────────────────────────────────────────────
@@ -721,6 +879,18 @@ data_source = st.sidebar.radio(
     ["Local files", "Odoo", "Database"],
     help="Use local artifacts, live Odoo stock, or a MySQL/MariaDB-compatible database.",
 )
+
+language = "Python"
+if data_source == "Local files":
+    language = st.sidebar.radio(
+        "Language",
+        ["Python", "R"],
+        help=(
+            "Python reads the LSTM/SVR outputs from the Python pipeline (store/raw/validation_*.xls). "
+            "R reads the equivalent outputs from train_pipeline.R "
+            "(store/raw/validation_*_R.csv) — run that script and copy its outputs into store/raw/ first."
+        ),
+    )
 
 db_config = None
 if data_source == "Database":
@@ -788,7 +958,7 @@ if connection_prompt:
 
 
 try:
-    pred_df, metrics_df, history_df, cleaned_df = load_data(data_source, db_config)
+    pred_df, metrics_df, history_df, cleaned_df = load_data(data_source, db_config, language)
 
     _debug_log(f"✔ data loaded from {data_source}")
     _debug_log(pred_df.head())
@@ -817,7 +987,7 @@ st.sidebar.header("Filters")
 st.sidebar.markdown("---")
 
 source_caption = {
-    "Local files": "local validation artifacts",
+    "Local files": f"local {language}-trained validation artifacts",
     "Odoo": "live Odoo stock over local forecast artifacts",
     "Database": "MySQL/MariaDB database",
 }[data_source]
