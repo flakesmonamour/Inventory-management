@@ -1,3 +1,27 @@
-.venv/
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.env/
+.venv/
+
+# VS Code
+.vscode/
+
+# Python cache
+.pytest_cache/
 .ipynb_checkpoints/
+
+# Build files
+build/
+dist/
+
+# Logs
+*.log
+
+# Database
+*.sqlite3
