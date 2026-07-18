@@ -4,7 +4,6 @@ library(lubridate)
 library(zoo)
 library(e1071)
 library(keras)
-library(reticulate)
 
 set.seed(42)
 tensorflow::set_random_seed(42)  # seeds TF/Keras/NumPy backend too - R's set.seed() alone does NOT reach Keras training
@@ -79,11 +78,8 @@ df$Season_Enc  <- season_map[df$Seasonality]
 
 region_dummies <- model.matrix(~ Region - 1, data = df) %>% as.data.frame()
 names(region_dummies) <- gsub("Region", "Region_", names(region_dummies))
-# Python's pd.get_dummies(..., drop_first=True) drops the FIRST category in
-# alphabetical order. Region categories are East, North, South, West, so
-# Python drops "East" and keeps North/South/West. Match that here — do NOT
-# drop Region_North (that was a bug in the previous version of this script,
-# and it meant the model was trained on the wrong region column).
+# Regions are East, North, South, West alphabetically - drop East so the
+# remaining three (North, South, West) act as the one-hot columns.
 region_dummies$Region_East <- NULL
 df <- bind_cols(df, region_dummies)
 
@@ -134,8 +130,7 @@ df_scaled <- df
 df_scaled[scale_cols] <- lapply(df[scale_cols], minmax_scale)
 cat(sprintf("\nMinMax scaling applied (0-1) to %d numerical features\n", length(scale_cols)))
 
-# Final feature set — order matches Python's FEATURE_COLS exactly (this order
-# matters: the Python-trained model expects columns in this exact sequence)
+# Final feature set
 region_dummy_cols <- names(region_dummies)[names(region_dummies) != "Region_East"]
 feature_cols <- c(
   "Inventory.Level", "Units.Ordered", "Demand.Forecast",
@@ -181,15 +176,13 @@ cat("\n", strrep("-", 60), "\n")
 cat("SVR MODEL (e1071)\n")
 cat(strrep("-", 60), "\n")
 
-# Python's sklearn SVR uses gamma='scale' = 1 / (n_features * X.var()),
-# where X.var() is the POPULATION variance (ddof=0) of the flattened
-# training matrix. e1071's svm() defaults to gamma = 1/ncol(x) if gamma
-# is left unset, which is a DIFFERENT value and made the two SVR models
-# diverge unnecessarily. Compute the sklearn-equivalent gamma explicitly
-# so R and Python are training with the same hyperparameter.
+# sklearn's default gamma='scale' = 1 / (n_features * X.var()) using population
+# variance. e1071's default gamma = 1/ncol(x) is a different value, so it's
+# computed explicitly here to give the SVR a sensible, deliberate hyperparameter
+# rather than relying on a wrapper default.
 X_train_pop_var <- mean((X_train - mean(X_train))^2)
 gamma_scale <- 1 / (ncol(X_train) * X_train_pop_var)
-cat(sprintf("SVR gamma (sklearn 'scale' equivalent) = %.8f\n", gamma_scale))
+cat(sprintf("SVR gamma = %.8f\n", gamma_scale))
 
 svr_model <- svm(
   x = X_train, y = y_train,
@@ -246,86 +239,9 @@ history <- lstm_model %>% fit(
   verbose = 1
 )
 
-# ---- Predictions from the R-trained LSTM (kept for the training-history
-#      chart / report evidence that R training happened) ----
-lstm_preds_r_trained <- as.numeric(predict(lstm_model, test_seq$X))
-
-# ---- Predictions from PYTHON's trained LSTM weights ----------------------
-# R and Python train on separate TensorFlow sessions/RNG streams, so even
-# with identical architecture, data and a fixed seed, the two LSTMs end up
-# as genuinely different trained models (this is a known, normal ML
-# reproducibility limitation — not a bug). Since the Reorder Alert / Expiry
-# Risk counts in the dashboard are driven entirely by LSTM_Predicted, the
-# most reliable way to make the R dashboard match the Python dashboard is
-# to load Python's already-trained model and generate predictions from it
-# using the R-built (but now correctly column-matched) test features.
-cat("\n", strrep("-", 60), "\n")
-cat("LOADING PYTHON-TRAINED LSTM FOR PREDICTION\n")
-cat(strrep("-", 60), "\n")
-
-# Build paths from RAW_PATH itself, so this does NOT depend on whatever the
-# current working directory happens to be when you run this script.
-# RAW_PATH = .../Inventory-management/store/raw/retail_store_inventory.csv
-STORE_DIR   <- dirname(dirname(RAW_PATH))              # .../store
-RAW_DIR     <- dirname(RAW_PATH)                       # .../store/raw
-PY_PRED_PATH <- file.path(RAW_DIR, "validation_predictions.xls")
-cat(sprintf("Looking for Python's predictions at: %s\n", PY_PRED_PATH))
-cat(sprintf("File exists: %s\n", file.exists(PY_PRED_PATH)))
-
-# Cross-language model loading (full model, then weights-only) both hit
-# Keras-version incompatibilities that depend on exactly which TensorFlow/
-# Keras build R's reticulate Python happens to have. Rather than keep
-# fighting environment version mismatches, use a more direct route: R's
-# test set has the SAME rows as Python's test set (same source CSV, same
-# Groceries filter, same Store/Product/Date sort, same 80/20 split), so we
-# can just read Python's already-computed LSTM_Predicted values straight
-# out of validation_predictions.xls and match them onto R's rows by
-# Date + Store ID + Product ID. This sidesteps model loading entirely.
-py_lstm_matched <- tryCatch({
-  py_pred <- read.csv(PY_PRED_PATH, stringsAsFactors = FALSE)
-  py_pred$Date <- as.character(as.Date(py_pred$Date))
-  py_pred <- py_pred[, c("Date", "Store.ID", "Product.ID", "LSTM_Predicted")]
-  names(py_pred) <- c("join_date", "join_store", "join_product", "py_lstm")
-  py_pred <- py_pred[!duplicated(py_pred[c("join_date", "join_store", "join_product")]), ]
-  
-  pred_rows <- (SEQ_LEN + 1):nrow(df_test)
-  join_key <- data.frame(
-    join_date    = as.character(df_test$Date[pred_rows]),
-    join_store   = df_test$Store.ID[pred_rows],
-    join_product = df_test$Product.ID[pred_rows],
-    row_order    = seq_along(pred_rows)
-  )
-  merged <- merge(join_key, py_pred, by = c("join_date", "join_store", "join_product"), all.x = TRUE)
-  merged <- merged[order(merged$row_order), ]
-  
-  n_matched <- sum(!is.na(merged$py_lstm))
-  cat(sprintf("Matched %d of %d test rows to Python's validation_predictions.xls\n",
-              n_matched, nrow(merged)))
-  if (n_matched < nrow(merged) * 0.95) {
-    stop(sprintf("Only %d of %d rows matched (< 95%%) - row alignment looks off, not using this.",
-                 n_matched, nrow(merged)))
-  }
-  merged$py_lstm
-}, error = function(e) {
-  cat(sprintf("WARNING: Could not match Python predictions.\n  Error: %s\nFalling back to the R-trained model's own predictions instead.\n",
-              conditionMessage(e)))
-  NULL
-})
-
-if (!is.null(py_lstm_matched) && sum(is.na(py_lstm_matched)) == 0) {
-  lstm_preds <- py_lstm_matched
-  cat("Using Python's saved LSTM_Predicted values (exact match to the Python dashboard).\n")
-} else if (!is.null(py_lstm_matched)) {
-  # Fill any unmatched rows with the R-trained model's own prediction for that row
-  na_idx <- is.na(py_lstm_matched)
-  py_lstm_matched[na_idx] <- lstm_preds_r_trained[na_idx]
-  lstm_preds <- py_lstm_matched
-  cat(sprintf("Using Python's saved LSTM_Predicted values (%d rows filled from R-trained model where no match was found).\n",
-              sum(na_idx)))
-} else {
-  lstm_preds <- lstm_preds_r_trained
-  cat("Using R-trained LSTM weights for LSTM_Predicted (Python predictions could not be matched).\n")
-}
+# Predictions come entirely from the R-trained model — nothing borrowed
+# from the Python pipeline.
+lstm_preds <- as.numeric(predict(lstm_model, test_seq$X))
 
 # ------------------------------------------------------------
 # STEP 05 — EVALUATION
@@ -347,20 +263,15 @@ evaluate_model <- function(name, y_true, y_pred) {
   data.frame(Model = name, sMAPE = round(s, 4), RMSE = round(r, 6), Accuracy = round(acc, 2))
 }
 
-svr_preds  <- predict(svr_model, X_test[(SEQ_LEN + 1):nrow(X_test), ])
+svr_preds <- predict(svr_model, X_test[(SEQ_LEN + 1):nrow(X_test), ])
 
-cat("\n--- R-trained LSTM (for reference / report evidence) ---")
-lstm_metrics_r_trained <- evaluate_model("LSTM (R-trained)", test_seq$y, lstm_preds_r_trained)
-
-cat("\n--- Python-weights LSTM (used for dashboard outputs) ---")
 lstm_metrics <- evaluate_model("LSTM", test_seq$y, lstm_preds)
 svr_metrics  <- evaluate_model("SVR",  test_seq$y, svr_preds)
 
 metrics_df <- rbind(lstm_metrics, svr_metrics)
 write.csv(metrics_df, "validation_metrics_R.csv", row.names = FALSE)
 
-# Save LSTM training history (from the R-trained model — this is real R
-# training evidence, independent of which model's predictions get used above)
+# Save LSTM training history
 history_df <- data.frame(
   epoch    = seq_along(history$metrics$loss),
   loss     = history$metrics$loss,
@@ -376,7 +287,7 @@ pred_rows <- (SEQ_LEN + 1):nrow(df_test)
 # Inventory.Level in df_test is already MinMax-scaled (0-1) from STEP 03
 inv_level <- df_test$Inventory.Level[pred_rows]
 
-# Same reorder/expiry-risk rules the dashboard applies elsewhere:
+# Same reorder/expiry-risk rules used throughout the project:
 # reorder alert  = predicted demand > 70% of current inventory
 # expiry risk    = inventory > 60% AND predicted demand < 30%
 reorder_alert <- as.integer(lstm_preds > (inv_level * 0.70))
@@ -397,17 +308,15 @@ predictions_df <- data.frame(
 )
 write.csv(predictions_df, "validation_predictions_R.csv", row.names = FALSE)
 
-# ---- Diagnostic: expiry-risk threshold behavior + LSTM collapse check ----
+# ---- Diagnostic: prediction spread + reorder/expiry counts ----
 cat("\n", strrep("-", 60), "\n")
 cat("DIAGNOSTIC: LSTM PREDICTION SPREAD & EXPIRY RISK\n")
 cat(strrep("-", 60), "\n")
-cat(sprintf("Actual                 : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
+cat(sprintf("Actual          : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
             mean(test_seq$y), sd(test_seq$y), min(test_seq$y), max(test_seq$y)))
-cat(sprintf("LSTM_Predicted (used)  : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
+cat(sprintf("LSTM_Predicted  : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
             mean(lstm_preds), sd(lstm_preds), min(lstm_preds), max(lstm_preds)))
-cat(sprintf("LSTM (R-trained, ref.) : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
-            mean(lstm_preds_r_trained), sd(lstm_preds_r_trained), min(lstm_preds_r_trained), max(lstm_preds_r_trained)))
-cat(sprintf("SVR_Predicted          : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
+cat(sprintf("SVR_Predicted   : mean=%.4f  sd=%.4f  range=[%.4f, %.4f]\n",
             mean(svr_preds), sd(svr_preds), min(svr_preds), max(svr_preds)))
 cat(strrep("-", 60), "\n")
 cat(sprintf("Rows with Inventory_Level > 0.60 : %d of %d\n", sum(inv_level > 0.60), length(inv_level)))
